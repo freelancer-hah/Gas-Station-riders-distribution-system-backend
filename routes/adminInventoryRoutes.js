@@ -530,21 +530,32 @@ router.get("/invoice/:id", protect, allowRoles("admin"), async (req, res) => {
 // Returns the invoice PDF as base64 in a JSON payload
 router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const invoice = await RiderInvoice.findById(req.params.id).populate("rider", "name phone");
+    const invoice = await RiderInvoice.findById(req.params.id)
+      .populate("rider", "name phone");
 
     if (!invoice) {
-      return res.status(404).json({ message: "Invoice not found" });
+      return res.status(404).json({
+        message: "Invoice not found",
+      });
     }
 
     const pdfBuffer = await generateRiderInvoicePDF(invoice);
 
-    res.json({
-      filename: `Invoice_${invoice.invoiceNumber}.pdf`,
-      base64: pdfBuffer.toString("base64"),
-    });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=Invoice_${invoice.invoiceNumber}.pdf`
+    );
+
+    return res.send(pdfBuffer);
+
   } catch (err) {
     console.error("Error generating invoice PDF:", err);
-    res.status(500).json({ message: "Failed to generate invoice PDF", error: err.message });
+
+    res.status(500).json({
+      message: "Failed to generate invoice PDF",
+      error: err.message,
+    });
   }
 });
 
