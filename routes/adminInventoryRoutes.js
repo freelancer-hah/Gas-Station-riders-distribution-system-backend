@@ -527,16 +527,13 @@ router.get("/invoice/:id", protect, allowRoles("admin"), async (req, res) => {
 });
 
 // GET /api/admin/invoice/:id/pdf
-// Returns the invoice PDF as base64 in a JSON payload
 router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) => {
   try {
     const invoice = await RiderInvoice.findById(req.params.id)
       .populate("rider", "name phone");
 
     if (!invoice) {
-      return res.status(404).json({
-        message: "Invoice not found",
-      });
+      return res.status(404).json({ message: "Invoice not found" });
     }
 
     const pdfBuffer = await generateRiderInvoicePDF(invoice);
@@ -551,7 +548,6 @@ router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) =>
 
   } catch (err) {
     console.error("Error generating invoice PDF:", err);
-
     res.status(500).json({
       message: "Failed to generate invoice PDF",
       error: err.message,
@@ -563,7 +559,6 @@ router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) =>
 router.get("/invoices/:riderId", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId } = req.params;
-    
     const invoices = await RiderInvoice.find({ rider: riderId })
       .populate("rider", "name phone")
       .sort({ createdAt: -1 });
@@ -572,6 +567,22 @@ router.get("/invoices/:riderId", protect, allowRoles("admin"), async (req, res) 
   } catch (err) {
     console.error("Error fetching invoices:", err);
     res.status(500).json({ message: "Failed to load invoices", error: err.message });
+  }
+});
+
+// ============================================================
+// NEW: GET ALL SALE INVOICES (Admin → Riders)
+// ============================================================
+
+router.get("/sale-invoices", protect, allowRoles("admin"), async (req, res) => {
+  try {
+    const invoices = await RiderInvoice.find()
+      .populate("rider", "name phone")
+      .sort({ createdAt: -1 });
+    res.json(invoices);
+  } catch (err) {
+    console.error("Error fetching sale invoices:", err);
+    res.status(500).json({ message: "Failed to load sale invoices", error: err.message });
   }
 });
 
