@@ -3,6 +3,7 @@ const Invoice = require("../models/Invoice");
 const Customer = require("../models/Customer");
 const RiderInventory = require("../models/RiderInventory");
 const RiderLedger = require("../models/RiderLedger");
+const Payment = require("../models/Payment");
 const generateNumber = require("../utils/generateNumber");
 const { protect } = require("../middleware/auth");
 
@@ -42,9 +43,15 @@ router.get("/:id", protect, async (req, res) => {
 // POST /api/invoices - Create Invoice (Rider sells to customer)
 router.post("/", protect, async (req, res) => {
   try {
-    const { customer: customerId, items, amountPaid = 0 } = req.body;
-    
-    console.log("📝 Creating invoice with:", { customerId, items, amountPaid });
+    const {
+      customer: customerId,
+      items,
+      amountPaid = 0,
+      paymentMethod = "cash",
+      paymentNotes = "",
+    } = req.body;
+
+    console.log("📝 Creating invoice with:", { customerId, items, amountPaid, paymentMethod, paymentNotes });
 
     if (!customerId) {
       return res.status(400).json({ message: "Customer is required" });
@@ -59,53 +66,48 @@ router.post("/", protect, async (req, res) => {
     }
 
     const preparedItems = [];
-    
     for (const item of items) {
       const { cylinderSize, weightKg, quantity, ratePerKg } = item;
-      
-      console.log(`📦 Processing: ${cylinderSize}, qty: ${quantity}, weight: ${weightKg}kg, rate: ${ratePerKg}/kg`);
 
       if (!cylinderSize || !weightKg || !quantity || !ratePerKg) {
-        return res.status(400).json({ 
-          message: `Missing fields for item: ${JSON.stringify(item)}` 
+        return res.status(400).json({
+          message: `Missing fields for item: ${JSON.stringify(item)}`,
         });
       }
 
       // Find rider inventory
-      const riderStock = await RiderInventory.findOne({ 
-        rider: riderId, 
-        cylinderSize: cylinderSize 
+      const riderStock = await RiderInventory.findOne({
+        rider: riderId,
+        cylinderSize: cylinderSize,
       });
-      
+
       if (!riderStock) {
-        return res.status(400).json({ 
-          message: `Cylinder size ${cylinderSize} not found in your inventory` 
+        return res.status(400).json({
+          message: `Cylinder size ${cylinderSize} not found in your inventory`,
         });
       }
-      
+
       if (riderStock.filledQty < quantity) {
-        return res.status(400).json({ 
-          message: `Insufficient stock for ${cylinderSize}. Available: ${riderStock.filledQty}, Need: ${quantity}` 
+        return res.status(400).json({
+          message: `Insufficient stock for ${cylinderSize}. Available: ${riderStock.filledQty}, Need: ${quantity}`,
         });
       }
-      
+
       // Update rider inventory: filled--, empty++
       riderStock.filledQty -= quantity;
       riderStock.emptyQty += quantity;
       await riderStock.save();
-      
-      console.log(`✅ Inventory updated: ${cylinderSize} filled: ${riderStock.filledQty}, empty: ${riderStock.emptyQty}`);
 
       const totalWeightKg = weightKg * quantity;
       const lineTotal = totalWeightKg * ratePerKg;
-      
-      preparedItems.push({ 
-        cylinderSize, 
-        weightKg, 
-        quantity, 
-        totalWeightKg, 
-        ratePerKg, 
-        lineTotal 
+
+      preparedItems.push({
+        cylinderSize,
+        weightKg,
+        quantity,
+        totalWeightKg,
+        ratePerKg,
+        lineTotal,
       });
     }
 
@@ -117,8 +119,23 @@ router.post("/", protect, async (req, res) => {
     }
 
     const previousBalance = customer.outstandingBalance || 0;
+    const paidAmount = Number(amountPaid) || 0;
+
+    // Grand total displayed on invoice = new sale + previous balance
     const grandTotal = subTotal + previousBalance;
-    const remainingBalance = grandTotal - Number(amountPaid);
+
+    // Remaining balance for this invoice (includes previous balance)
+    const remainingBalance = Math.max(0, grandTotal - paidAmount);
+
+    // Invoice status: "paid" if the NEW sale amount is fully covered
+    let status;
+    if (paidAmount >= subTotal) {
+      status = "paid";
+    } else if (paidAmount > 0) {
+      status = "partial";
+    } else {
+      status = "unpaid";
+    }
 
     // Create invoice
     const invoice = await Invoice.create({
@@ -129,15 +146,15 @@ router.post("/", protect, async (req, res) => {
       subTotal,
       previousBalance,
       grandTotal,
-      amountPaid: Number(amountPaid),
-      remainingBalance: Math.max(0, remainingBalance),
-      status: remainingBalance <= 0 ? "paid" : amountPaid > 0 ? "partial" : "unpaid",
+      amountPaid: paidAmount,
+      remainingBalance,
+      status,
     });
 
     console.log(`✅ Invoice created: ${invoice.invoiceNumber}`);
 
     // Update customer outstanding balance
-    customer.outstandingBalance = Math.max(0, remainingBalance);
+    customer.outstandingBalance = remainingBalance;
     await customer.save();
 
     // Update rider ledger - track sold to customers
@@ -150,7 +167,23 @@ router.post("/", protect, async (req, res) => {
       await riderLedger.save();
     }
 
-    // Populate and return full invoice with customer and rider details
+    // Record payment if amountPaid > 0
+    let payment = null;
+    if (paidAmount > 0) {
+      payment = await Payment.create({
+        type: "customer",
+        customer: customerId,
+        invoice: invoice._id,
+        amount: paidAmount,
+        method: paymentMethod,
+        receivedBy: riderId,
+        notes: paymentNotes || `Payment on invoice ${invoice.invoiceNumber}`,
+        paymentDate: new Date(),
+      });
+      console.log(`✅ Payment recorded: ${payment._id}`);
+    }
+
+    // Populate and return full invoice
     const populatedInvoice = await Invoice.findById(invoice._id)
       .populate("customer", "name businessName phone")
       .populate("rider", "name phone");
@@ -158,14 +191,14 @@ router.post("/", protect, async (req, res) => {
     res.status(201).json({
       success: true,
       message: `Invoice ${populatedInvoice.invoiceNumber} created successfully`,
-      invoice: populatedInvoice
+      invoice: populatedInvoice,
+      payment, // may be null if no payment
     });
-
   } catch (err) {
     console.error("❌ Invoice creation error:", err);
-    res.status(500).json({ 
-      message: "Failed to create invoice", 
-      error: err.message 
+    res.status(500).json({
+      message: "Failed to create invoice",
+      error: err.message,
     });
   }
 });
