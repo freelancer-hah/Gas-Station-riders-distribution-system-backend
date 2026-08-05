@@ -1,8 +1,10 @@
 const mongoose = require("mongoose");
 
+const { SIZE_LABELS } = require("../constants/cylinderSizes");
+
 const invoiceItemSchema = new mongoose.Schema(
   {
-    cylinderSize: { type: String, required: true },
+    cylinderSize: { type: String, required: true, enum: SIZE_LABELS },
     weightKg: { type: Number, required: true },
     quantity: { type: Number, required: true },
     totalWeightKg: { type: Number, required: true },

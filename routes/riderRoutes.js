@@ -6,6 +6,8 @@ const RiderTransaction = require("../models/RiderTransaction");
 const AdminInventory = require("../models/AdminInventory");
 const Invoice = require("../models/Invoice");
 const { protect, allowRoles } = require("../middleware/auth");
+const { SIZE_LABELS, getWeightBySize } = require("../constants/cylinderSizes");
+const generateNumber = require("../utils/generateNumber");
 
 const router = express.Router();
 
@@ -29,8 +31,8 @@ router.get("/pending", protect, allowRoles("admin"), async (req, res) => {
 router.put("/:id/verify", protect, allowRoles("admin"), async (req, res) => {
   try {
     const rider = await User.findByIdAndUpdate(
-      req.params.id, 
-      { isActive: true }, 
+      req.params.id,
+      { isActive: true },
       { new: true }
     );
     if (!rider) return res.status(404).json({ message: "Rider not found" });
@@ -45,8 +47,8 @@ router.put("/:id/verify", protect, allowRoles("admin"), async (req, res) => {
 router.put("/:id/deactivate", protect, allowRoles("admin"), async (req, res) => {
   try {
     const rider = await User.findByIdAndUpdate(
-      req.params.id, 
-      { isActive: false }, 
+      req.params.id,
+      { isActive: false },
       { new: true }
     );
     if (!rider) return res.status(404).json({ message: "Rider not found" });
@@ -61,8 +63,8 @@ router.put("/:id/deactivate", protect, allowRoles("admin"), async (req, res) => 
 router.put("/:id/activate", protect, allowRoles("admin"), async (req, res) => {
   try {
     const rider = await User.findByIdAndUpdate(
-      req.params.id, 
-      { isActive: true }, 
+      req.params.id,
+      { isActive: true },
       { new: true }
     );
     if (!rider) return res.status(404).json({ message: "Rider not found" });
@@ -90,9 +92,9 @@ router.get("/:id/summary", protect, allowRoles("admin"), async (req, res) => {
     const inventory = await RiderInventory.find({ rider: req.params.id });
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    const todaysInvoices = await Invoice.find({ 
-      rider: req.params.id, 
-      createdAt: { $gte: todayStart } 
+    const todaysInvoices = await Invoice.find({
+      rider: req.params.id,
+      createdAt: { $gte: todayStart }
     });
     const todaysSales = todaysInvoices.reduce((sum, i) => sum + i.subTotal, 0);
     const todaysCollection = todaysInvoices.reduce((sum, i) => sum + i.amountPaid, 0);
@@ -114,7 +116,7 @@ router.get("/me", protect, async (req, res) => {
     const transactions = await RiderTransaction.find({ rider: riderId })
       .sort({ createdAt: -1 })
       .limit(20);
-    
+
     res.json({
       rider: req.user.toSafeObject(),
       inventory,
@@ -140,9 +142,9 @@ router.get("/my-balance", protect, async (req, res) => {
   try {
     const riderId = req.user.id;
     const ledger = await RiderLedger.findOne({ rider: riderId });
-    const payments = await RiderTransaction.find({ 
-      rider: riderId, 
-      type: "payment" 
+    const payments = await RiderTransaction.find({
+      rider: riderId,
+      type: "payment"
     }).sort({ createdAt: -1 });
 
     res.json({
@@ -162,7 +164,7 @@ router.post("/pay-admin", protect, async (req, res) => {
   try {
     const riderId = req.user.id;
     const { amount, method, notes } = req.body;
-    
+
     if (!amount || Number(amount) <= 0) {
       return res.status(400).json({ message: "Valid amount is required" });
     }
@@ -202,85 +204,114 @@ router.post("/pay-admin", protect, async (req, res) => {
       transaction,
       remainingOutstanding: ledger.outstandingBalance,
     });
-
   } catch (err) {
     console.error("Error processing payment:", err);
     res.status(500).json({ message: "Failed to process payment", error: err.message });
   }
 });
 
-// POST /api/riders/return-empty - rider returns empty cylinders
+// ============================================================
+// ✅ UPDATED: RIDER RETURNS MULTIPLE EMPTY CYLINDERS
+// ============================================================
+
+// POST /api/riders/return-empty
 router.post("/return-empty", protect, async (req, res) => {
   try {
     const riderId = req.user.id;
-    const { cylinderSize, emptyQty } = req.body;
-    
-    if (!cylinderSize || !emptyQty || Number(emptyQty) <= 0) {
-      return res.status(400).json({ message: "Cylinder size and valid quantity are required" });
+    const { items } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: "At least one cylinder size is required" });
     }
 
-    // Check rider inventory
-    const riderStock = await RiderInventory.findOne({ 
-      rider: riderId, 
-      cylinderSize: cylinderSize.trim() 
-    });
-    
-    if (!riderStock) {
-      return res.status(400).json({ 
-        message: `Cylinder size ${cylinderSize} not found in your inventory` 
+    const rider = await User.findById(riderId);
+    if (!rider || rider.role !== "rider") {
+      return res.status(404).json({ message: "Rider not found" });
+    }
+
+    let totalEmptyReturned = 0;
+    let transactionNotes = [];
+
+    for (const item of items) {
+      const { cylinderSize, emptyQty } = item;
+
+      if (!cylinderSize) {
+        return res.status(400).json({ message: "Cylinder size is required for all items" });
+      }
+      if (!emptyQty || Number(emptyQty) <= 0) {
+        return res.status(400).json({ message: "Valid empty quantity is required for all items" });
+      }
+
+      // Validate and format size (add space if needed)
+      const size = cylinderSize.trim().toUpperCase();
+      // Ensure it's in the correct format (e.g., "23 KG")
+      const formattedSize = size.replace(/(\d+)(KG)/i, '$1 KG');
+      if (!SIZE_LABELS.includes(formattedSize)) {
+        return res.status(400).json({
+          message: `Invalid cylinder size ${formattedSize}. Allowed: ${SIZE_LABELS.join(", ")}`,
+        });
+      }
+
+      const qty = Number(emptyQty);
+
+      // Check rider inventory for this size
+      const riderStock = await RiderInventory.findOne({
+        rider: riderId,
+        cylinderSize: formattedSize,
       });
-    }
-    
-    if (riderStock.emptyQty < Number(emptyQty)) {
-      return res.status(400).json({ 
-        message: `You only have ${riderStock.emptyQty} empty cylinders to return` 
-      });
+
+      if (!riderStock || riderStock.emptyQty < qty) {
+        return res.status(400).json({
+          message: `Insufficient empty cylinders for ${formattedSize}. Available: ${riderStock?.emptyQty || 0}, Requested: ${qty}`,
+        });
+      }
+
+      // 1. Update Rider Inventory (subtract empty)
+      riderStock.emptyQty -= qty;
+      await riderStock.save();
+
+      // 2. Update Admin Inventory (add empty)
+      let adminStock = await AdminInventory.findOne({ cylinderSize: formattedSize });
+      if (!adminStock) {
+        adminStock = await AdminInventory.create({
+          cylinderSize: formattedSize,
+          weightKg: riderStock.weightKg || 0,
+          filledQty: 0,
+          emptyQty: qty,
+          saleRatePerKg: riderStock.ratePerKg || 0,
+        });
+      } else {
+        adminStock.emptyQty += qty;
+        await adminStock.save();
+      }
+
+      totalEmptyReturned += qty;
+      transactionNotes.push(`${qty} of ${formattedSize}`);
     }
 
-    // Update admin inventory (add empty cylinders)
-    let adminStock = await AdminInventory.findOne({ cylinderSize: cylinderSize.trim() });
-    if (!adminStock) {
-      // Create admin inventory if it doesn't exist
-      adminStock = await AdminInventory.create({
-        cylinderSize: cylinderSize.trim(),
-        weightKg: riderStock.weightKg || 0,
-        filledQty: 0,
-        emptyQty: Number(emptyQty),
-      });
-    } else {
-      adminStock.emptyQty += Number(emptyQty);
-      await adminStock.save();
-    }
-
-    // Update rider inventory
-    riderStock.emptyQty -= Number(emptyQty);
-    await riderStock.save();
-
-    // Create transaction record
+    // 3. Create ONE transaction
     const transaction = await RiderTransaction.create({
-      transactionNumber: `RET-${Date.now()}`,
+      transactionNumber: generateNumber("RET"),
       rider: riderId,
       type: "return_empty",
-      cylinderSize: cylinderSize.trim(),
-      emptyQty: Number(emptyQty),
-      notes: `Returned ${emptyQty} empty cylinders of ${cylinderSize}`,
+      cylinderSize: "MULTI",
+      emptyQty: totalEmptyReturned,
+      notes: `Returned ${totalEmptyReturned} empty cylinders (${transactionNotes.join(", ")})`,
       createdBy: riderId,
     });
 
-    // Update rider ledger
+    // 4. Update Rider Ledger
     const ledger = await RiderLedger.findOne({ rider: riderId });
     if (ledger) {
-      ledger.totalEmptyReturned = (ledger.totalEmptyReturned || 0) + Number(emptyQty);
-      ledger.currentEmptyBalance = Math.max(0, (ledger.currentEmptyBalance || 0) - Number(emptyQty));
+      ledger.totalEmptyReturned = (ledger.totalEmptyReturned || 0) + totalEmptyReturned;
+      ledger.currentEmptyBalance = Math.max(0, (ledger.currentEmptyBalance || 0) - totalEmptyReturned);
       await ledger.save();
     }
 
     res.json({
       success: true,
-      message: `Returned ${emptyQty} empty cylinders of ${cylinderSize}`,
+      message: `Returned ${totalEmptyReturned} empty cylinders to admin`,
       transaction,
-      riderStock,
-      adminStock,
       ledger,
     });
 

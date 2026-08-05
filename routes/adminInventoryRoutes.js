@@ -8,12 +8,9 @@ const User = require("../models/User");
 const generateNumber = require("../utils/generateNumber");
 const generateRiderInvoicePDF = require("../utils/generateRiderInvoicePDF");
 const { protect, allowRoles } = require("../middleware/auth");
+const { SIZE_LABELS, getWeightBySize } = require("../constants/cylinderSizes");
 
 const router = express.Router();
-
-// ============================================================
-// ADMIN INVENTORY ROUTES
-// ============================================================
 
 // GET /api/admin/inventory
 router.get("/inventory", protect, allowRoles("admin"), async (req, res) => {
@@ -30,13 +27,27 @@ router.get("/inventory", protect, allowRoles("admin"), async (req, res) => {
 router.post("/inventory", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { cylinderSize, weightKg, filledQty, emptyQty, saleRatePerKg } = req.body;
-    
+
     if (!cylinderSize || !weightKg) {
       return res.status(400).json({ message: "Cylinder size and weight are required" });
     }
 
-    let inventory = await AdminInventory.findOne({ cylinderSize: cylinderSize.trim().toUpperCase() });
-    
+    const size = cylinderSize.trim().toUpperCase();
+    if (!SIZE_LABELS.includes(size)) {
+      return res.status(400).json({
+        message: `Invalid cylinder size. Allowed: ${SIZE_LABELS.join(", ")}`,
+      });
+    }
+
+    const expectedWeight = getWeightBySize(size);
+    if (Number(weightKg) !== expectedWeight) {
+      return res.status(400).json({
+        message: `Weight for ${size} must be exactly ${expectedWeight} kg`,
+      });
+    }
+
+    let inventory = await AdminInventory.findOne({ cylinderSize: size });
+
     if (inventory) {
       inventory.weightKg = weightKg || inventory.weightKg;
       inventory.filledQty = filledQty !== undefined ? filledQty : inventory.filledQty;
@@ -45,7 +56,7 @@ router.post("/inventory", protect, allowRoles("admin"), async (req, res) => {
       await inventory.save();
     } else {
       inventory = await AdminInventory.create({
-        cylinderSize: cylinderSize.trim().toUpperCase(),
+        cylinderSize: size,
         weightKg: weightKg,
         filledQty: filledQty || 0,
         emptyQty: emptyQty || 0,
@@ -61,25 +72,18 @@ router.post("/inventory", protect, allowRoles("admin"), async (req, res) => {
 });
 
 // ============================================================
-// SELL TO RIDER WITH INVOICE
+// SELL MULTIPLE CYLINDER SIZES TO RIDER
 // ============================================================
 
-// POST /api/admin/sell-to-rider
 router.post("/sell-to-rider", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const { riderId, weightKg, filledQty, ratePerKg } = req.body;
-    
+    const { riderId, items } = req.body;
+
     if (!riderId) {
       return res.status(400).json({ message: "Rider is required" });
     }
-    if (!weightKg || Number(weightKg) <= 0) {
-      return res.status(400).json({ message: "Valid cylinder weight is required" });
-    }
-    if (!filledQty || Number(filledQty) <= 0) {
-      return res.status(400).json({ message: "Valid number of cylinders is required" });
-    }
-    if (!ratePerKg || Number(ratePerKg) <= 0) {
-      return res.status(400).json({ message: "Valid rate per kg is required" });
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: "At least one item is required" });
     }
 
     const rider = await User.findById(riderId);
@@ -87,125 +91,140 @@ router.post("/sell-to-rider", protect, allowRoles("admin"), async (req, res) => 
       return res.status(404).json({ message: "Rider not found" });
     }
 
-    const weight = Number(weightKg);
-    const qty = Number(filledQty);
-    const rate = Number(ratePerKg);
-    
-    const totalWeightKg = weight * qty;
-    const totalAmount = totalWeightKg * rate;
-    const size = `${weight}KG`;
+    let subTotal = 0;
+    let totalCylinders = 0;
+    const invoiceItems = [];
 
-    // 1. UPDATE ADMIN INVENTORY
-    let adminStock = await AdminInventory.findOne({ cylinderSize: size });
-    if (!adminStock) {
-      adminStock = await AdminInventory.create({
+    for (const item of items) {
+      const { weightKg, filledQty, ratePerKg } = item;
+
+      if (!weightKg || Number(weightKg) <= 0) {
+        return res.status(400).json({ message: "Valid cylinder weight is required for all items" });
+      }
+      if (!filledQty || Number(filledQty) <= 0) {
+        return res.status(400).json({ message: "Valid number of cylinders is required for all items" });
+      }
+      if (!ratePerKg || Number(ratePerKg) <= 0) {
+        return res.status(400).json({ message: "Valid rate per kg is required for all items" });
+      }
+
+      const size = `${Number(weightKg)} KG`;
+      if (!SIZE_LABELS.includes(size)) {
+        return res.status(400).json({
+          message: `Invalid cylinder size ${size}. Allowed: ${SIZE_LABELS.join(", ")}`,
+        });
+      }
+      const expectedWeight = getWeightBySize(size);
+      if (Number(weightKg) !== expectedWeight) {
+        return res.status(400).json({
+          message: `Weight for ${size} must be exactly ${expectedWeight} kg`,
+        });
+      }
+
+      const weight = Number(weightKg);
+      const qty = Number(filledQty);
+      const rate = Number(ratePerKg);
+      const totalWeightKg = weight * qty;
+      const lineTotal = totalWeightKg * rate;
+
+      subTotal += lineTotal;
+      totalCylinders += qty;
+
+      invoiceItems.push({
         cylinderSize: size,
         weightKg: weight,
-        filledQty: 0,
-        emptyQty: 0,
-        saleRatePerKg: rate,
+        quantity: qty,
+        totalWeightKg: totalWeightKg,
+        ratePerKg: rate,
+        lineTotal: lineTotal,
       });
-    } else {
-      if (adminStock.weightKg !== weight) {
-        adminStock.weightKg = weight;
-      }
-      adminStock.saleRatePerKg = rate;
-    }
-    adminStock.filledQty = Math.max(0, adminStock.filledQty - qty);
-    await adminStock.save();
 
-    // 2. UPDATE RIDER INVENTORY
-    let riderStock = await RiderInventory.findOne({ 
-      rider: riderId, 
-      cylinderSize: size 
-    });
-    if (!riderStock) {
-      riderStock = await RiderInventory.create({
+      let adminStock = await AdminInventory.findOne({ cylinderSize: size });
+      if (!adminStock) {
+        adminStock = await AdminInventory.create({
+          cylinderSize: size,
+          weightKg: weight,
+          filledQty: 0,
+          emptyQty: 0,
+          saleRatePerKg: rate,
+        });
+      } else {
+        if (adminStock.weightKg !== weight) adminStock.weightKg = weight;
+        adminStock.saleRatePerKg = rate;
+      }
+      adminStock.filledQty = Math.max(0, adminStock.filledQty - qty);
+      await adminStock.save();
+
+      let riderStock = await RiderInventory.findOne({
         rider: riderId,
         cylinderSize: size,
-        weightKg: weight,
-        filledQty: qty,
-        emptyQty: 0,
-        ratePerKg: rate,
       });
-    } else {
-      riderStock.filledQty += qty;
-      riderStock.ratePerKg = rate;
-      if (riderStock.weightKg !== weight) {
-        riderStock.weightKg = weight;
+      if (!riderStock) {
+        riderStock = await RiderInventory.create({
+          rider: riderId,
+          cylinderSize: size,
+          weightKg: weight,
+          filledQty: qty,
+          emptyQty: 0,
+          ratePerKg: rate,
+        });
+      } else {
+        riderStock.filledQty += qty;
+        riderStock.ratePerKg = rate;
+        if (riderStock.weightKg !== weight) riderStock.weightKg = weight;
+        await riderStock.save();
       }
-      await riderStock.save();
     }
 
-    // 3. CREATE TRANSACTION
     const transaction = await RiderTransaction.create({
       transactionNumber: generateNumber("RTR"),
       rider: riderId,
       type: "purchase",
-      cylinderSize: size,
-      filledQty: qty,
-      ratePerKg: rate,
-      totalWeightKg: totalWeightKg,
-      totalAmount: totalAmount,
-      notes: `Admin sold ${qty} cylinders of ${weight}kg to ${rider.name}`,
+      cylinderSize: "MULTI",
+      filledQty: totalCylinders,
+      ratePerKg: 0,
+      totalWeightKg: 0,
+      totalAmount: subTotal,
+      notes: `Admin sold ${totalCylinders} cylinders in multiple sizes to ${rider.name}`,
       createdBy: req.user.id,
     });
 
-    // 4. CREATE INVOICE
     const invoice = await RiderInvoice.create({
       invoiceNumber: generateNumber("RINV"),
       rider: riderId,
       transaction: transaction._id,
-      cylinderSize: size,
-      weightKg: weight,
-      quantity: qty,
-      totalWeightKg: totalWeightKg,
-      ratePerKg: rate,
-      totalAmount: totalAmount,
-      notes: `Sale of ${qty} cylinders of ${weight}kg to ${rider.name}`,
+      items: invoiceItems,
+      subTotal: subTotal,
+      totalAmount: subTotal,
+      notes: `Sale of ${totalCylinders} cylinders to ${rider.name}`,
       createdBy: req.user.id,
     });
 
-    // 5. UPDATE RIDER LEDGER
     let ledger = await RiderLedger.findOne({ rider: riderId });
     if (!ledger) {
       ledger = await RiderLedger.create({
         rider: riderId,
-        totalFilledReceived: qty,
-        currentFilledBalance: qty,
-        totalPurchased: totalAmount,
-        outstandingBalance: totalAmount,
+        totalFilledReceived: totalCylinders,
+        currentFilledBalance: totalCylinders,
+        totalPurchased: subTotal,
+        outstandingBalance: subTotal,
         totalPaid: 0,
       });
     } else {
-      ledger.totalFilledReceived += qty;
-      ledger.currentFilledBalance += qty;
-      ledger.totalPurchased += totalAmount;
-      ledger.outstandingBalance += totalAmount;
+      ledger.totalFilledReceived += totalCylinders;
+      ledger.currentFilledBalance += totalCylinders;
+      ledger.totalPurchased += subTotal;
+      ledger.outstandingBalance += subTotal;
       await ledger.save();
     }
 
+    const populatedInvoice = await RiderInvoice.findById(invoice._id).populate("rider", "name phone");
+
     res.json({
       success: true,
-      message: `Sold ${qty} cylinders of ${weight}kg to ${rider.name}`,
-      invoice: {
-        id: invoice._id,
-        invoiceNumber: invoice.invoiceNumber,
-        cylinderSize: invoice.cylinderSize,
-        quantity: invoice.quantity,
-        weightKg: invoice.weightKg,
-        totalWeightKg: invoice.totalWeightKg,
-        ratePerKg: invoice.ratePerKg,
-        totalAmount: invoice.totalAmount,
-        date: invoice.createdAt,
-        rider: {
-          name: rider.name,
-          phone: rider.phone,
-        }
-      },
+      message: `Sold ${totalCylinders} cylinders to ${rider.name}`,
+      invoice: populatedInvoice,
       transaction,
-      adminStock,
-      riderStock,
       ledger: {
         totalFilledReceived: ledger.totalFilledReceived,
         totalEmptyReturned: ledger.totalEmptyReturned || 0,
@@ -224,16 +243,19 @@ router.post("/sell-to-rider", protect, allowRoles("admin"), async (req, res) => 
 });
 
 // ============================================================
-// RECEIVE EMPTY CYLINDERS
+// ✅ UPDATED: RECEIVE MULTIPLE EMPTY CYLINDER SIZES
 // ============================================================
 
 // POST /api/admin/receive-empty
 router.post("/receive-empty", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const { riderId, cylinderSize, emptyQty } = req.body;
-    
-    if (!riderId || !cylinderSize || !emptyQty || emptyQty <= 0) {
-      return res.status(400).json({ message: "Rider, cylinder size and valid quantity are required" });
+    const { riderId, items } = req.body;
+
+    if (!riderId) {
+      return res.status(400).json({ message: "Rider is required" });
+    }
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: "At least one cylinder size is required" });
     }
 
     const rider = await User.findById(riderId);
@@ -241,58 +263,86 @@ router.post("/receive-empty", protect, allowRoles("admin"), async (req, res) => 
       return res.status(404).json({ message: "Rider not found" });
     }
 
-    const size = cylinderSize.trim().toUpperCase();
+    let totalEmptyReturned = 0;
+    let transactionNotes = [];
 
-    const riderStock = await RiderInventory.findOne({ 
-      rider: riderId, 
-      cylinderSize: size 
-    });
-    if (!riderStock || riderStock.emptyQty < emptyQty) {
-      return res.status(400).json({ 
-        message: `Insufficient empty cylinders. Available: ${riderStock?.emptyQty || 0}, Returning: ${emptyQty}` 
-      });
-    }
+    // Process each item in the cart
+    for (const item of items) {
+      const { cylinderSize, emptyQty } = item;
 
-    let adminStock = await AdminInventory.findOne({ cylinderSize: size });
-    if (!adminStock) {
-      adminStock = await AdminInventory.create({
+      if (!cylinderSize) {
+        return res.status(400).json({ message: "Cylinder size is required for all items" });
+      }
+      if (!emptyQty || Number(emptyQty) <= 0) {
+        return res.status(400).json({ message: "Valid empty quantity is required for all items" });
+      }
+
+      const size = cylinderSize.trim().toUpperCase();
+      if (!SIZE_LABELS.includes(size)) {
+        return res.status(400).json({
+          message: `Invalid cylinder size ${size}. Allowed: ${SIZE_LABELS.join(", ")}`,
+        });
+      }
+
+      const qty = Number(emptyQty);
+
+      // Check rider inventory for this size
+      const riderStock = await RiderInventory.findOne({
+        rider: riderId,
         cylinderSize: size,
-        weightKg: riderStock.weightKg || 0,
-        filledQty: 0,
-        emptyQty: emptyQty,
-        saleRatePerKg: riderStock.ratePerKg || 0,
       });
-    } else {
-      adminStock.emptyQty += emptyQty;
-      await adminStock.save();
+      if (!riderStock || riderStock.emptyQty < qty) {
+        return res.status(400).json({
+          message: `Insufficient empty cylinders for ${size}. Available: ${riderStock?.emptyQty || 0}, Requested: ${qty}`,
+        });
+      }
+
+      // 1. Update Admin Inventory (add empty)
+      let adminStock = await AdminInventory.findOne({ cylinderSize: size });
+      if (!adminStock) {
+        adminStock = await AdminInventory.create({
+          cylinderSize: size,
+          weightKg: riderStock.weightKg || 0,
+          filledQty: 0,
+          emptyQty: qty,
+          saleRatePerKg: riderStock.ratePerKg || 0,
+        });
+      } else {
+        adminStock.emptyQty += qty;
+        await adminStock.save();
+      }
+
+      // 2. Update Rider Inventory (subtract empty)
+      riderStock.emptyQty -= qty;
+      await riderStock.save();
+
+      totalEmptyReturned += qty;
+      transactionNotes.push(`${qty} of ${size}`);
     }
 
-    riderStock.emptyQty -= emptyQty;
-    await riderStock.save();
-
+    // 3. Create ONE transaction
     const transaction = await RiderTransaction.create({
       transactionNumber: generateNumber("RET"),
       rider: riderId,
       type: "return_empty",
-      cylinderSize: size,
-      emptyQty: emptyQty,
-      notes: `${rider.name} returned ${emptyQty} empty cylinders of ${size}`,
+      cylinderSize: "MULTI",
+      emptyQty: totalEmptyReturned,
+      notes: `${rider.name} returned ${totalEmptyReturned} empty cylinders (${transactionNotes.join(", ")})`,
       createdBy: req.user.id,
     });
 
+    // 4. Update Rider Ledger
     const ledger = await RiderLedger.findOne({ rider: riderId });
     if (ledger) {
-      ledger.totalEmptyReturned = (ledger.totalEmptyReturned || 0) + emptyQty;
-      ledger.currentEmptyBalance = Math.max(0, (ledger.currentEmptyBalance || 0) - emptyQty);
+      ledger.totalEmptyReturned = (ledger.totalEmptyReturned || 0) + totalEmptyReturned;
+      ledger.currentEmptyBalance = Math.max(0, (ledger.currentEmptyBalance || 0) - totalEmptyReturned);
       await ledger.save();
     }
 
     res.json({
       success: true,
-      message: `Received ${emptyQty} empty cylinders of ${size} from ${rider.name}`,
+      message: `Received ${totalEmptyReturned} empty cylinders from ${rider.name}`,
       transaction,
-      adminStock,
-      riderStock,
       ledger,
     });
 
@@ -306,11 +356,10 @@ router.post("/receive-empty", protect, allowRoles("admin"), async (req, res) => 
 // RECORD PAYMENT
 // ============================================================
 
-// POST /api/admin/record-payment
 router.post("/record-payment", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId, amount, method, notes } = req.body;
-    
+
     if (!riderId) {
       return res.status(400).json({ message: "Rider is required" });
     }
@@ -328,7 +377,6 @@ router.post("/record-payment", protect, allowRoles("admin"), async (req, res) =>
       return res.status(400).json({ message: "No ledger found for this rider" });
     }
 
-    // Create payment transaction
     const transaction = await RiderTransaction.create({
       transactionNumber: generateNumber("PAY"),
       rider: riderId,
@@ -337,11 +385,10 @@ router.post("/record-payment", protect, allowRoles("admin"), async (req, res) =>
       filledQty: 0,
       emptyQty: 0,
       totalAmount: Number(amount),
-      notes: notes || `Payment via ${method || 'cash'}`,
+      notes: notes || `Payment via ${method || "cash"}`,
       createdBy: req.user.id,
     });
 
-    // Update ledger
     ledger.totalPaid = (ledger.totalPaid || 0) + Number(amount);
     ledger.outstandingBalance = Math.max(0, ledger.outstandingBalance - Number(amount));
     await ledger.save();
@@ -362,7 +409,6 @@ router.post("/record-payment", protect, allowRoles("admin"), async (req, res) =>
         totalPurchased: ledger.totalPurchased,
       },
     });
-
   } catch (err) {
     console.error("❌ Error recording payment:", err);
     res.status(500).json({ message: "Failed to record payment", error: err.message });
@@ -373,43 +419,44 @@ router.post("/record-payment", protect, allowRoles("admin"), async (req, res) =>
 // REPORTS & SUMMARIES
 // ============================================================
 
-// GET /api/admin/riders-summary
 router.get("/riders-summary", protect, allowRoles("admin"), async (req, res) => {
   try {
     const riders = await User.find({ role: "rider", isActive: true }).select("name phone");
-    
-    const summary = await Promise.all(riders.map(async (rider) => {
-      const ledger = await RiderLedger.findOne({ rider: rider._id });
-      const inventory = await RiderInventory.find({ rider: rider._id });
-      const transactions = await RiderTransaction.find({ rider: rider._id });
-      
-      const totalFilled = inventory.reduce((sum, item) => sum + (item.filledQty || 0), 0);
-      const totalEmpty = inventory.reduce((sum, item) => sum + (item.emptyQty || 0), 0);
-      
-      return {
-        rider: {
-          id: rider._id,
-          name: rider.name,
-          phone: rider.phone,
-        },
-        ledger: ledger || {
-          totalFilledReceived: 0,
-          totalEmptyReturned: 0,
-          currentFilledBalance: 0,
-          currentEmptyBalance: 0,
-          totalPurchased: 0,
-          totalPaid: 0,
-          outstandingBalance: 0,
-        },
-        inventory: {
-          items: inventory,
-          totalFilled,
-          totalEmpty,
-          totalCylinders: totalFilled + totalEmpty,
-        },
-        transactionCount: transactions.length,
-      };
-    }));
+
+    const summary = await Promise.all(
+      riders.map(async (rider) => {
+        const ledger = await RiderLedger.findOne({ rider: rider._id });
+        const inventory = await RiderInventory.find({ rider: rider._id });
+        const transactions = await RiderTransaction.find({ rider: rider._id });
+
+        const totalFilled = inventory.reduce((sum, item) => sum + (item.filledQty || 0), 0);
+        const totalEmpty = inventory.reduce((sum, item) => sum + (item.emptyQty || 0), 0);
+
+        return {
+          rider: {
+            id: rider._id,
+            name: rider.name,
+            phone: rider.phone,
+          },
+          ledger: ledger || {
+            totalFilledReceived: 0,
+            totalEmptyReturned: 0,
+            currentFilledBalance: 0,
+            currentEmptyBalance: 0,
+            totalPurchased: 0,
+            totalPaid: 0,
+            outstandingBalance: 0,
+          },
+          inventory: {
+            items: inventory,
+            totalFilled,
+            totalEmpty,
+            totalCylinders: totalFilled + totalEmpty,
+          },
+          transactionCount: transactions.length,
+        };
+      })
+    );
 
     res.json({
       riders: summary,
@@ -421,12 +468,11 @@ router.get("/riders-summary", protect, allowRoles("admin"), async (req, res) => 
   }
 });
 
-// GET /api/admin/sales-report
 router.get("/sales-report", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { from, to } = req.query;
     const filter = { type: "purchase" };
-    
+
     if (from || to) {
       filter.createdAt = {};
       if (from) filter.createdAt.$gte = new Date(from);
@@ -446,7 +492,7 @@ router.get("/sales-report", protect, allowRoles("admin"), async (req, res) => {
         totalAmount,
         totalTransactions: sales.length,
         totalCylinders,
-      }
+      },
     });
   } catch (err) {
     console.error("Error fetching sales report:", err);
@@ -454,12 +500,11 @@ router.get("/sales-report", protect, allowRoles("admin"), async (req, res) => {
   }
 });
 
-// GET /api/admin/payment-collection
 router.get("/payment-collection", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { from, to, riderId } = req.query;
     const filter = { type: "payment" };
-    
+
     if (from || to) {
       filter.createdAt = {};
       if (from) filter.createdAt.$gte = new Date(from);
@@ -480,7 +525,7 @@ router.get("/payment-collection", protect, allowRoles("admin"), async (req, res)
       summary: {
         totalAmount,
         totalPayments: payments.length,
-      }
+      },
     });
   } catch (err) {
     console.error("Error fetching payment collection:", err);
@@ -492,16 +537,14 @@ router.get("/payment-collection", protect, allowRoles("admin"), async (req, res)
 // TRANSACTION & INVOICE ROUTES
 // ============================================================
 
-// GET /api/admin/transaction/:id
 router.get("/transaction/:id", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const transaction = await RiderTransaction.findById(req.params.id)
-      .populate("rider", "name phone");
-    
+    const transaction = await RiderTransaction.findById(req.params.id).populate("rider", "name phone");
+
     if (!transaction) {
       return res.status(404).json({ message: "Transaction not found" });
     }
-    
+
     res.json(transaction);
   } catch (err) {
     console.error("Error fetching transaction:", err);
@@ -509,16 +552,14 @@ router.get("/transaction/:id", protect, allowRoles("admin"), async (req, res) =>
   }
 });
 
-// GET /api/admin/invoice/:id
 router.get("/invoice/:id", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const invoice = await RiderInvoice.findById(req.params.id)
-      .populate("rider", "name phone");
-    
+    const invoice = await RiderInvoice.findById(req.params.id).populate("rider", "name phone");
+
     if (!invoice) {
       return res.status(404).json({ message: "Invoice not found" });
     }
-    
+
     res.json(invoice);
   } catch (err) {
     console.error("Error fetching invoice:", err);
@@ -526,11 +567,9 @@ router.get("/invoice/:id", protect, allowRoles("admin"), async (req, res) => {
   }
 });
 
-// GET /api/admin/invoice/:id/pdf
 router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) => {
   try {
-    const invoice = await RiderInvoice.findById(req.params.id)
-      .populate("rider", "name phone");
+    const invoice = await RiderInvoice.findById(req.params.id).populate("rider", "name phone");
 
     if (!invoice) {
       return res.status(404).json({ message: "Invoice not found" });
@@ -539,13 +578,9 @@ router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) =>
     const pdfBuffer = await generateRiderInvoicePDF(invoice);
 
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=Invoice_${invoice.invoiceNumber}.pdf`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename=Invoice_${invoice.invoiceNumber}.pdf`);
 
     return res.send(pdfBuffer);
-
   } catch (err) {
     console.error("Error generating invoice PDF:", err);
     res.status(500).json({
@@ -555,7 +590,6 @@ router.get("/invoice/:id/pdf", protect, allowRoles("admin"), async (req, res) =>
   }
 });
 
-// GET /api/admin/invoices/:riderId
 router.get("/invoices/:riderId", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId } = req.params;
@@ -569,10 +603,6 @@ router.get("/invoices/:riderId", protect, allowRoles("admin"), async (req, res) 
     res.status(500).json({ message: "Failed to load invoices", error: err.message });
   }
 });
-
-// ============================================================
-// NEW: GET ALL SALE INVOICES (Admin → Riders)
-// ============================================================
 
 router.get("/sale-invoices", protect, allowRoles("admin"), async (req, res) => {
   try {
@@ -590,20 +620,17 @@ router.get("/sale-invoices", protect, allowRoles("admin"), async (req, res) => {
 // RIDER LEDGER ROUTES
 // ============================================================
 
-// GET /api/admin/rider-ledger/:riderId
 router.get("/rider-ledger/:riderId", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId } = req.params;
-    
+
     const rider = await User.findById(riderId).select("name phone");
     if (!rider) {
       return res.status(404).json({ message: "Rider not found" });
     }
 
     const ledger = await RiderLedger.findOne({ rider: riderId });
-    const transactions = await RiderTransaction.find({ rider: riderId })
-      .sort({ transactionDate: -1 });
-
+    const transactions = await RiderTransaction.find({ rider: riderId }).sort({ transactionDate: -1 });
     const inventory = await RiderInventory.find({ rider: riderId });
 
     res.json({
@@ -626,11 +653,10 @@ router.get("/rider-ledger/:riderId", protect, allowRoles("admin"), async (req, r
   }
 });
 
-// GET /api/admin/rider-inventory/:riderId
 router.get("/rider-inventory/:riderId", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId } = req.params;
-    
+
     const rider = await User.findById(riderId).select("name phone");
     if (!rider) {
       return res.status(404).json({ message: "Rider not found" });
@@ -655,119 +681,135 @@ router.get("/rider-inventory/:riderId", protect, allowRoles("admin"), async (req
   }
 });
 
-// GET /api/admin/export-rider-ledger/:riderId
 router.get("/export-rider-ledger/:riderId", protect, allowRoles("admin"), async (req, res) => {
   try {
     const { riderId } = req.params;
-    
+
     const rider = await User.findById(riderId).select("name phone");
     if (!rider) {
       return res.status(404).json({ message: "Rider not found" });
     }
 
     const ledger = await RiderLedger.findOne({ rider: riderId });
-    const transactions = await RiderTransaction.find({ rider: riderId })
-      .sort({ transactionDate: -1 });
+    const transactions = await RiderTransaction.find({ rider: riderId }).sort({ transactionDate: -1 });
     const inventory = await RiderInventory.find({ rider: riderId });
-    const invoices = await RiderInvoice.find({ rider: riderId })
-      .sort({ createdAt: -1 });
+    const invoices = await RiderInvoice.find({ rider: riderId }).sort({ createdAt: -1 });
 
-    // Generate PDF
-    const PDFDocument = require('pdfkit');
-    const doc = new PDFDocument({ margin: 50, size: 'A4' });
-    
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Rider_Ledger_${rider.name.replace(/\s/g, '_')}.pdf`);
-    
+    const PDFDocument = require("pdfkit");
+    const doc = new PDFDocument({ margin: 50, size: "A4" });
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=Rider_Ledger_${rider.name.replace(/\s/g, "_")}.pdf`
+    );
+
     doc.pipe(res);
 
     const colors = {
-      primary: '#0F62FE',
-      dark: '#161616',
-      gray: '#6F6F6F',
-      lightGray: '#F4F4F4',
-      danger: '#DA1E28',
-      success: '#24A148',
-      border: '#E0E0E0',
+      primary: "#0F62FE",
+      dark: "#161616",
+      gray: "#6F6F6F",
+      lightGray: "#F4F4F4",
+      danger: "#DA1E28",
+      success: "#24A148",
+      border: "#E0E0E0",
     };
 
-    // Header
-    doc.fontSize(20).font('Helvetica-Bold').fillColor(colors.primary).text('Rider Ledger Report', { align: 'center' });
+    doc.fontSize(20).font("Helvetica-Bold").fillColor(colors.primary).text("Rider Ledger Report", { align: "center" });
     doc.moveDown(0.5);
-    doc.fontSize(10).font('Helvetica').fillColor(colors.gray).text(`Generated: ${new Date().toLocaleString()}`, { align: 'right' });
+    doc.fontSize(10).font("Helvetica").fillColor(colors.gray).text(`Generated: ${new Date().toLocaleString()}`, {
+      align: "right",
+    });
     doc.moveDown(0.5);
 
-    // Rider Info
-    doc.fontSize(14).font('Helvetica-Bold').fillColor(colors.dark).text(`Rider: ${rider.name}`);
-    doc.fontSize(10).font('Helvetica').fillColor(colors.gray).text(`Phone: ${rider.phone || 'N/A'}`);
+    doc.fontSize(14).font("Helvetica-Bold").fillColor(colors.dark).text(`Rider: ${rider.name}`);
+    doc.fontSize(10).font("Helvetica").fillColor(colors.gray).text(`Phone: ${rider.phone || "N/A"}`);
     doc.moveDown(1);
 
-    // Summary Box
     const summaryY = doc.y;
     doc.rect(50, summaryY, 500, 80).fillAndStroke(colors.lightGray, colors.border);
-    
+
     const summaryTexts = [
-      { label: 'Total Received', value: ledger?.totalFilledReceived || 0 },
-      { label: 'Empty Returned', value: ledger?.totalEmptyReturned || 0 },
-      { label: 'Total Purchased', value: `Rs. ${(ledger?.totalPurchased || 0).toLocaleString()}` },
-      { label: 'Total Paid', value: `Rs. ${(ledger?.totalPaid || 0).toLocaleString()}` },
-      { label: 'Outstanding', value: `Rs. ${(ledger?.outstandingBalance || 0).toLocaleString()}`, color: (ledger?.outstandingBalance || 0) > 0 ? colors.danger : colors.success },
+      { label: "Total Received", value: ledger?.totalFilledReceived || 0 },
+      { label: "Empty Returned", value: ledger?.totalEmptyReturned || 0 },
+      { label: "Total Purchased", value: `Rs. ${(ledger?.totalPurchased || 0).toLocaleString()}` },
+      { label: "Total Paid", value: `Rs. ${(ledger?.totalPaid || 0).toLocaleString()}` },
+      {
+        label: "Outstanding",
+        value: `Rs. ${(ledger?.outstandingBalance || 0).toLocaleString()}`,
+        color: (ledger?.outstandingBalance || 0) > 0 ? colors.danger : colors.success,
+      },
     ];
 
     summaryTexts.forEach((item, index) => {
-      const x = 60 + (index * 95);
-      doc.fontSize(8).font('Helvetica').fillColor(colors.gray).text(item.label, x, summaryY + 8, { width: 90 });
-      doc.fontSize(10).font('Helvetica-Bold').fillColor(item.color || colors.dark).text(String(item.value), x, summaryY + 22, { width: 90 });
+      const x = 60 + index * 95;
+      doc.fontSize(8).font("Helvetica").fillColor(colors.gray).text(item.label, x, summaryY + 8, { width: 90 });
+      doc.fontSize(10).font("Helvetica-Bold").fillColor(item.color || colors.dark).text(String(item.value), x, summaryY + 22, {
+        width: 90,
+      });
     });
 
     doc.moveDown(3);
 
-    // Current Inventory
     if (inventory && inventory.length > 0) {
-      doc.fontSize(12).font('Helvetica-Bold').fillColor(colors.dark).text('Current Inventory');
+      doc.fontSize(12).font("Helvetica-Bold").fillColor(colors.dark).text("Current Inventory");
       doc.moveDown(0.5);
-      
+
       const tableTop = doc.y;
       const colWidths = [150, 100, 100, 100];
-      const headers = ['Cylinder Size', 'Filled', 'Empty', 'Total'];
-      
+      const headers = ["Cylinder Size", "Filled", "Empty", "Total"];
+
       doc.rect(50, tableTop, 500, 20).fill(colors.primary);
       headers.forEach((header, i) => {
         let x = 55;
         for (let j = 0; j < i; j++) x += colWidths[j];
-        doc.fontSize(9).font('Helvetica-Bold').fillColor('#FFFFFF').text(header, x, tableTop + 5, { width: colWidths[i] - 5, align: 'left' });
+        doc.fontSize(9).font("Helvetica-Bold").fillColor("#FFFFFF").text(header, x, tableTop + 5, {
+          width: colWidths[i] - 5,
+          align: "left",
+        });
       });
 
       let yPos = tableTop + 25;
       inventory.forEach((item, index) => {
-        const rowColor = index % 2 === 0 ? '#FFFFFF' : colors.lightGray;
+        const rowColor = index % 2 === 0 ? "#FFFFFF" : colors.lightGray;
         doc.rect(50, yPos - 2, 500, 20).fill(rowColor);
-        
-        const values = [item.cylinderSize, item.filledQty || 0, item.emptyQty || 0, (item.filledQty || 0) + (item.emptyQty || 0)];
+
+        const values = [
+          item.cylinderSize,
+          item.filledQty || 0,
+          item.emptyQty || 0,
+          (item.filledQty || 0) + (item.emptyQty || 0),
+        ];
         values.forEach((value, i) => {
           let x = 55;
           for (let j = 0; j < i; j++) x += colWidths[j];
-          doc.fontSize(9).font('Helvetica').fillColor(colors.dark).text(String(value), x, yPos, { width: colWidths[i] - 5, align: 'left' });
+          doc.fontSize(9).font("Helvetica").fillColor(colors.dark).text(String(value), x, yPos, {
+            width: colWidths[i] - 5,
+            align: "left",
+          });
         });
         yPos += 20;
       });
       doc.moveDown(1);
     }
 
-    // Transactions
-    doc.fontSize(12).font('Helvetica-Bold').fillColor(colors.dark).text('Transaction History');
+    doc.fontSize(12).font("Helvetica-Bold").fillColor(colors.dark).text("Transaction History");
     doc.moveDown(0.5);
 
     if (transactions && transactions.length > 0) {
       const transTop = doc.y;
       const transCols = [70, 80, 80, 100, 80, 80];
-      const transHeaders = ['Date', 'Type', 'Reference', 'Cylinder', 'Amount', 'Balance'];
-      
+      const transHeaders = ["Date", "Type", "Reference", "Cylinder", "Amount", "Balance"];
+
       doc.rect(50, transTop, 500, 20).fill(colors.primary);
       transHeaders.forEach((header, i) => {
         let x = 55;
         for (let j = 0; j < i; j++) x += transCols[j];
-        doc.fontSize(8).font('Helvetica-Bold').fillColor('#FFFFFF').text(header, x, transTop + 5, { width: transCols[i] - 5, align: 'left' });
+        doc.fontSize(8).font("Helvetica-Bold").fillColor("#FFFFFF").text(header, x, transTop + 5, {
+          width: transCols[i] - 5,
+          align: "left",
+        });
       });
 
       let transY = transTop + 25;
@@ -779,39 +821,43 @@ router.get("/export-rider-ledger/:riderId", protect, allowRoles("admin"), async 
           transHeaders.forEach((header, i) => {
             let x = 55;
             for (let j = 0; j < i; j++) x += transCols[j];
-            doc.fontSize(8).font('Helvetica-Bold').fillColor('#FFFFFF').text(header, x, transY + 5, { width: transCols[i] - 5, align: 'left' });
+            doc.fontSize(8).font("Helvetica-Bold").fillColor("#FFFFFF").text(header, x, transY + 5, {
+              width: transCols[i] - 5,
+              align: "left",
+            });
           });
           transY += 25;
         }
 
-        const rowColor = index % 2 === 0 ? '#FFFFFF' : colors.lightGray;
+        const rowColor = index % 2 === 0 ? "#FFFFFF" : colors.lightGray;
         doc.rect(50, transY - 2, 500, 20).fill(rowColor);
-        
+
         const values = [
           new Date(t.transactionDate || t.createdAt).toLocaleDateString(),
-          t.type || 'N/A',
-          t.transactionNumber || '-',
-          t.cylinderSize || '-',
+          t.type || "N/A",
+          t.transactionNumber || "-",
+          t.cylinderSize || "-",
           (t.totalAmount || 0).toLocaleString(),
-          '...',
+          "...",
         ];
         values.forEach((value, i) => {
           let x = 55;
           for (let j = 0; j < i; j++) x += transCols[j];
           const isAmount = i === 4;
-          doc.fontSize(8).font('Helvetica').fillColor(isAmount ? colors.primary : colors.dark).text(String(value), x, transY, { width: transCols[i] - 5, align: 'left' });
+          doc.fontSize(8).font("Helvetica").fillColor(isAmount ? colors.primary : colors.dark).text(String(value), x, transY, {
+            width: transCols[i] - 5,
+            align: "left",
+          });
         });
         transY += 20;
       });
     }
 
-    // Footer
     doc.moveDown(1);
-    doc.fontSize(8).fillColor(colors.gray).text('Generated from Gas Cylinder Management System', { align: 'center' });
-    doc.text(`© ${new Date().getFullYear()} All Rights Reserved`, { align: 'center' });
+    doc.fontSize(8).fillColor(colors.gray).text("Generated from Gas Cylinder Management System", { align: "center" });
+    doc.text(`© ${new Date().getFullYear()} All Rights Reserved`, { align: "center" });
 
     doc.end();
-
   } catch (err) {
     console.error("Error exporting rider ledger:", err);
     res.status(500).json({ message: "Failed to export rider ledger", error: err.message });
