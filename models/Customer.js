@@ -4,7 +4,7 @@ const customerSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     businessName: { type: String, trim: true },
-    phone: { type: String, required: true, trim: true },
+    phone: { type: String, trim: true, default: "" },
     address: { type: String, trim: true },
     creditLimit: { type: Number, default: 0 },
     outstandingBalance: { type: Number, default: 0 },
